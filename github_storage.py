@@ -28,10 +28,16 @@ class GitHubStorageConflictError(GitHubStorageError):
     """La branche a changé pendant une sauvegarde."""
 
 
+class GitHubStoragePublicRepoError(GitHubStorageError):
+    """Le dépôt de données est public : les saisies seraient visibles de tous."""
+
+
 class GitHubStorage:
     """Lit et valide plusieurs fichiers dans un unique commit GitHub."""
 
     api_root = "https://api.github.com"
+    # Dépôts déjà vérifiés privés, partagés par toutes les sessions du processus.
+    _verified_private_repos: set[str] = set()
 
     def __init__(
         self,
@@ -109,8 +115,27 @@ class GitHubStorage:
             allow_not_found=True,
         )
 
+    def ensure_private(self) -> None:
+        """Refuse de lire ou d'écrire des données métier dans un dépôt public."""
+        if self.repo_path in self._verified_private_repos:
+            return
+        repository = self._request("GET", self.repo_path, allow_not_found=True)
+        if repository is None:
+            raise GitHubStorageError(
+                f"Dépôt « {self.owner}/{self.repo} » introuvable, ou le token n'y a "
+                "pas accès."
+            )
+        if not repository.get("private"):
+            raise GitHubStoragePublicRepoError(
+                f"Le dépôt « {self.owner}/{self.repo} » est public : les saisies "
+                "seraient visibles par tout le monde. Indiquez un dépôt privé dans "
+                "la clé `repo` des Secrets."
+            )
+        self._verified_private_repos.add(self.repo_path)
+
     def ensure_branch(self) -> str:
         """Crée la branche de données si nécessaire et renvoie son commit courant."""
+        self.ensure_private()
         current = self._read_ref(self.branch)
         if current is not None:
             return str(current["object"]["sha"])

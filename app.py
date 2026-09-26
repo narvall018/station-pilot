@@ -3,14 +3,16 @@
 Lancement :
     streamlit run app.py
 
-Les données permanentes sont conservées sous forme de CSV dans une branche
-GitHub privée. SQLite sert uniquement de cache temporaire pendant l'exécution.
+Les données permanentes sont conservées sous forme de CSV dans un dépôt GitHub
+privé, distinct du code. SQLite sert uniquement de cache temporaire pendant
+l'exécution.
 Les montants USD et LBP restent toujours séparés ; les conversions ne servent
 qu'aux indicateurs consolidés.
 """
 
 from __future__ import annotations
 
+import hmac
 import os
 import sqlite3
 import tempfile
@@ -68,7 +70,7 @@ def get_github_storage() -> GitHubStorage:
     return GitHubStorage(
         token=token,
         owner=str(secrets.get("owner", "narvall018")),
-        repo=str(secrets.get("repo", "station-pilot")),
+        repo=str(secrets.get("repo", "station-pilot-data")),
         branch=str(secrets.get("branch", "data")),
         source_branch=str(secrets.get("source_branch", "main")),
     )
@@ -4342,8 +4344,9 @@ def render_history_tab(history: pd.DataFrame) -> None:
     )
 
     with st.expander("Informations sur le stockage GitHub"):
-        st.write("Source permanente : dépôt GitHub privé `narvall018/station-pilot`.")
-        st.write("Branche de données : `data`.")
+        storage = get_github_storage()
+        st.write(f"Source permanente : dépôt GitHub privé `{storage.owner}/{storage.repo}`.")
+        st.write(f"Branche de données : `{storage.branch}`.")
         st.write("Fichiers : `station_data.csv`, `station_credits.csv` et "
                  "`station_credit_payments.csv`.")
         st.write(
@@ -4472,8 +4475,34 @@ def render_sidebar_navigation(history: pd.DataFrame) -> str:
             """,
             unsafe_allow_html=True,
         )
-        st.caption("Les CSV permanents sont enregistrés sur la branche GitHub « data ».")
+        st.caption("Les CSV permanents sont enregistrés dans le dépôt GitHub privé de données.")
     return selected_page
+
+
+def require_password() -> None:
+    """Bloque l'application tant que le mot de passe des Secrets n'est pas saisi."""
+    if st.session_state.get("authenticated"):
+        return
+    try:
+        expected = str(st.secrets.get("app_access", {}).get("password", "")).strip()
+    except Exception:  # Aucun fichier de secrets pendant certains tests locaux.
+        expected = ""
+    if not expected:
+        st.error("Aucun mot de passe n'est configuré.")
+        st.code('[app_access]\npassword = "CHOISISSEZ_UN_MOT_DE_PASSE"', language="toml")
+        st.caption("Ajoutez ces lignes dans les Secrets de Streamlit Cloud.")
+        st.stop()
+
+    with st.form("login"):
+        st.subheader("Station Pilot")
+        password = st.text_input("Mot de passe", type="password")
+        submitted = st.form_submit_button("Entrer", type="primary")
+    if submitted:
+        if hmac.compare_digest(password.encode("utf-8"), expected.encode("utf-8")):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        st.error("Mot de passe incorrect.")
+    st.stop()
 
 
 def main() -> None:
@@ -4486,6 +4515,7 @@ def main() -> None:
     palette = THEMES[resolve_theme()]
     apply_theme_config(palette)
     apply_styles(palette)
+    require_password()
 
     try:
         restored_rows = initialize_storage()
@@ -4496,13 +4526,13 @@ def main() -> None:
             '[github_storage]\n'
             'token = "NOUVEAU_TOKEN_GITHUB"\n'
             'owner = "narvall018"\n'
-            'repo = "station-pilot"\n'
+            'repo = "station-pilot-data"\n'
             'branch = "data"',
             language="toml",
         )
         st.caption(
-            "Ajoutez ces valeurs dans les Secrets de Streamlit Cloud, avec un nouveau "
-            "token autorisé à lire et écrire le contenu du dépôt."
+            "Ajoutez ces valeurs dans les Secrets de Streamlit Cloud, avec un token "
+            "autorisé à lire et écrire le contenu du dépôt privé de données."
         )
         st.stop()
     except GitHubStorageConflictError as exc:

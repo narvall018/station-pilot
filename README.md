@@ -24,7 +24,8 @@ L’application est ensuite disponible sur `http://localhost:8501`.
 
 ## Stockage permanent sur GitHub
 
-Les données permanentes sont enregistrées dans la branche privée `data` :
+Le code (ce dépôt) peut être public. Les données sont enregistrées à part, dans
+la branche `data` du dépôt **privé** `station-pilot-data` :
 
 - `data/station_data.csv` ;
 - `data/station_credits.csv` ;
@@ -32,21 +33,28 @@ Les données permanentes sont enregistrées dans la branche privée `data` :
 
 Les trois fichiers sont mis à jour ensemble dans un commit GitHub. La base SQLite
 utilisée par l’application n’est qu’un cache temporaire reconstruit depuis ces CSV.
-Le dépôt doit rester privé car les fichiers contiennent des données métier.
+L’application refuse de fonctionner si le dépôt de données est public, car les
+fichiers contiennent des données métier.
+
+Le dépôt de données doit avoir une branche `main` (créez-le avec un README) : la
+branche `data` est créée automatiquement au premier lancement.
 
 Dans Streamlit Community Cloud, ouvrez **App settings > Secrets** et ajoutez :
 
 ```toml
+[app_access]
+password = "MOT_DE_PASSE_DE_L_APP"
+
 [github_storage]
 token = "NOUVEAU_TOKEN_GITHUB"
 owner = "narvall018"
-repo = "station-pilot"
+repo = "station-pilot-data"
 branch = "data"
 ```
 
-Utilisez un nouveau fine-grained personal access token limité au dépôt
-`station-pilot`, avec la permission **Contents: Read and write**. Ne placez jamais
-le vrai token dans un fichier suivi par Git.
+Utilisez un fine-grained personal access token limité au dépôt
+`station-pilot-data`, avec la permission **Contents: Read and write**. Ne placez
+jamais le vrai token dans un fichier suivi par Git.
 
 Pour un lancement local, les mêmes valeurs peuvent être placées dans
 `.streamlit/secrets.toml`, qui est ignoré par Git.
