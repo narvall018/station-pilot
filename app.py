@@ -3,14 +3,17 @@
 Lancement :
     streamlit run app.py
 
-Les données sont conservées localement dans ``station_data.db`` (SQLite), dans
-le même dossier que ce fichier. Les montants USD et LBP restent toujours
-séparés ; les conversions ne servent qu'aux indicateurs consolidés.
+Les données permanentes sont conservées sous forme de CSV dans une branche
+GitHub privée. SQLite sert uniquement de cache temporaire pendant l'exécution.
+Les montants USD et LBP restent toujours séparés ; les conversions ne servent
+qu'aux indicateurs consolidés.
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import tempfile
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
@@ -20,13 +23,55 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from github_storage import (
+    GitHubStorage,
+    GitHubStorageConflictError,
+    GitHubStorageError,
+)
+
 
 APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "station_data.db"
-CSV_PATH = APP_DIR / "station_data.csv"
-CREDITS_CSV_PATH = APP_DIR / "station_credits.csv"
-CREDIT_PAYMENTS_CSV_PATH = APP_DIR / "station_credit_payments.csv"
-BACKUP_DIR = APP_DIR / "backups"
+RUNTIME_DIR = Path(tempfile.gettempdir()) / "station_pilot_runtime"
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = RUNTIME_DIR / "station_data.db"
+CSV_PATH = RUNTIME_DIR / "station_data.csv"
+CREDITS_CSV_PATH = RUNTIME_DIR / "station_credits.csv"
+CREDIT_PAYMENTS_CSV_PATH = RUNTIME_DIR / "station_credit_payments.csv"
+REMOTE_HEAD_PATH = RUNTIME_DIR / ".github_data_head"
+
+REMOTE_DATA_FILES = {
+    "data/station_data.csv": CSV_PATH,
+    "data/station_credits.csv": CREDITS_CSV_PATH,
+    "data/station_credit_payments.csv": CREDIT_PAYMENTS_CSV_PATH,
+}
+
+
+class StorageConfigurationError(RuntimeError):
+    """Le stockage GitHub n'est pas configuré dans les secrets Streamlit."""
+
+
+def get_github_storage() -> GitHubStorage:
+    """Construit le client GitHub sans exposer le jeton dans le dépôt."""
+    try:
+        secrets = st.secrets.get("github_storage", {})
+    except Exception:  # Aucun fichier de secrets pendant certains tests locaux.
+        secrets = {}
+
+    token = str(
+        secrets.get("token", os.environ.get("STATION_PILOT_GITHUB_TOKEN", ""))
+    ).strip()
+    if not token:
+        raise StorageConfigurationError(
+            "Ajoutez un nouveau jeton GitHub dans les Secrets de Streamlit Cloud."
+        )
+
+    return GitHubStorage(
+        token=token,
+        owner=str(secrets.get("owner", "narvall018")),
+        repo=str(secrets.get("repo", "station-pilot")),
+        branch=str(secrets.get("branch", "data")),
+        source_branch=str(secrets.get("source_branch", "main")),
+    )
 
 MONTHS_FR = {
     1: "Janvier",
@@ -737,8 +782,29 @@ def enrich_data(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([frame.reset_index(drop=True), totals.reset_index(drop=True)], axis=1)
 
 
-def sync_csv_backup() -> None:
-    """Crée deux copies CSV atomiques : journées et clients à crédit."""
+def _write_remote_head(commit_sha: str) -> None:
+    temporary_path = REMOTE_HEAD_PATH.with_suffix(".tmp")
+    temporary_path.write_text(commit_sha, encoding="utf-8")
+    temporary_path.replace(REMOTE_HEAD_PATH)
+
+
+def _read_remote_head() -> str | None:
+    try:
+        value = REMOTE_HEAD_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def _write_bytes_atomically(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    temporary_path.write_bytes(content)
+    temporary_path.replace(path)
+
+
+def sync_csv_backup(expected_head: str | None = None) -> None:
+    """Réécrit les trois CSV puis les valide ensemble sur GitHub."""
     frame = load_data().copy()
     if "record_date" in frame:
         frame["record_date"] = pd.to_datetime(frame["record_date"], errors="coerce").dt.strftime(
@@ -766,27 +832,32 @@ def sync_csv_backup() -> None:
     payments.to_csv(temporary_payments_path, index=False, encoding="utf-8-sig")
     temporary_payments_path.replace(CREDIT_PAYMENTS_CSV_PATH)
 
+    storage = get_github_storage()
+    parent_commit = expected_head or _read_remote_head()
+    try:
+        new_commit = storage.commit_files(
+            {
+                remote_path: local_path.read_bytes()
+                for remote_path, local_path in REMOTE_DATA_FILES.items()
+            },
+            message=(
+                "data: synchronisation Station Pilot "
+                f"{datetime.now().isoformat(timespec='seconds')}"
+            ),
+            expected_head=parent_commit,
+        )
+    except GitHubStorageError:
+        # Un prochain rerun rechargera la version distante au lieu de garder
+        # silencieusement une modification non sauvegardée dans le cache.
+        REMOTE_HEAD_PATH.unlink(missing_ok=True)
+        raise
+    _write_remote_head(new_commit)
 
 
 def backup_database() -> str:
-    """Copie complète et cohérente de la base, avant toute opération destructive.
-
-    Utilise l'API de sauvegarde de SQLite plutôt qu'une copie de fichier : le
-    mode WAL peut laisser des écritures hors du fichier principal.
-    """
-    BACKUP_DIR.mkdir(exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    backup_path = BACKUP_DIR / f"station_avant_suppression_{stamp}.db"
-    source = get_connection()
-    try:
-        target = sqlite3.connect(backup_path)
-        try:
-            source.backup(target)
-        finally:
-            target.close()
-    finally:
-        source.close()
-    return backup_path.name
+    """Renvoie le commit GitHub qui précède une suppression."""
+    commit_sha = _read_remote_head() or get_github_storage().head_sha()
+    return f"commit GitHub {commit_sha[:7]}"
 
 
 def delete_records(record_dates: Sequence[str]) -> tuple[list[str], str]:
@@ -835,8 +906,8 @@ def delete_records(record_dates: Sequence[str]) -> tuple[list[str], str]:
     finally:
         connection.close()
 
-    # Les CSV sont réécrits depuis la base : sans cela, une base vidée serait
-    # restaurée depuis l'ancien CSV au prochain démarrage.
+    # Le nouveau commit conserve l'ancien commit dans l'historique GitHub : une
+    # suppression accidentelle reste donc récupérable.
     sync_csv_backup()
     return existing, backup_name
 
@@ -918,16 +989,56 @@ def restore_database_from_csv() -> int:
 
 
 def initialize_storage() -> int:
-    """Initialise le stockage sans réécrire les sauvegardes à chaque rerun."""
+    """Synchronise le cache temporaire avec la branche GitHub de données."""
+    storage = get_github_storage()
+    remote_head = storage.head_sha()
+    cache_ready = DB_PATH.exists() and all(
+        path.exists() for path in REMOTE_DATA_FILES.values()
+    )
+
+    if cache_ready and _read_remote_head() == remote_head:
+        initialize_database()
+        migrated = migrate_legacy_credits()
+        if migrated:
+            sync_csv_backup(expected_head=remote_head)
+        return 0
+
+    remote_files, stable_head = storage.download_files(list(REMOTE_DATA_FILES))
+    remote_was_empty = all(content is None for content in remote_files.values())
+    if remote_was_empty:
+        # Première installation : une exécution locale peut importer les anciens
+        # CSV placés à côté de app.py. Sur Streamlit Cloud, une base vide est créée.
+        for remote_path, runtime_path in REMOTE_DATA_FILES.items():
+            legacy_path = APP_DIR / runtime_path.name
+            if legacy_path.exists():
+                remote_files[remote_path] = legacy_path.read_bytes()
+
+    main_remote_path = "data/station_data.csv"
+    if remote_files[main_remote_path] is None:
+        for path in (DB_PATH, Path(f"{DB_PATH}-wal"), Path(f"{DB_PATH}-shm")):
+            path.unlink(missing_ok=True)
+        initialize_database()
+        _write_remote_head(stable_head)
+        sync_csv_backup(expected_head=stable_head)
+        return 0
+
+    missing_remote_file = False
+    for remote_path, runtime_path in REMOTE_DATA_FILES.items():
+        content = remote_files[remote_path]
+        if content is None:
+            runtime_path.unlink(missing_ok=True)
+            missing_remote_file = True
+        else:
+            _write_bytes_atomically(runtime_path, content)
+
+    for path in (DB_PATH, Path(f"{DB_PATH}-wal"), Path(f"{DB_PATH}-shm")):
+        path.unlink(missing_ok=True)
     initialize_database()
-    with get_connection() as connection:
-        row_count = connection.execute("SELECT COUNT(*) FROM daily_records").fetchone()[0]
-    restored = restore_database_from_csv() if row_count == 0 else 0
+    restored = restore_database_from_csv()
+    _write_remote_head(stable_head)
     migrated = migrate_legacy_credits()
-    backup_paths = (CSV_PATH, CREDITS_CSV_PATH, CREDIT_PAYMENTS_CSV_PATH)
-    backup_missing = any(not path.exists() or path.stat().st_size == 0 for path in backup_paths)
-    if restored or migrated or backup_missing:
-        sync_csv_backup()
+    if migrated or missing_remote_file or remote_was_empty:
+        sync_csv_backup(expected_head=stable_head)
     return restored
 
 
@@ -3164,7 +3275,7 @@ def render_entry_tab(history: pd.DataFrame) -> bool:
                     "action": action,
                 }
                 changed = True
-            except (OSError, sqlite3.Error, ValueError) as exc:
+            except (OSError, sqlite3.Error, GitHubStorageError, ValueError) as exc:
                 st.error(f"Enregistrement impossible : {exc}")
 
     if "last_saved_summary" in st.session_state:
@@ -4230,14 +4341,14 @@ def render_history_tab(history: pd.DataFrame) -> None:
         width="stretch",
     )
 
-    with st.expander("Informations sur le stockage local"):
-        st.write(f"Base SQLite : `{DB_PATH.name}`")
-        st.write(f"Copie CSV synchronisée : `{CSV_PATH.name}`")
-        st.write(f"Détail des clients à crédit : `{CREDITS_CSV_PATH.name}`")
-        st.write(f"Détail des crédits encaissés : `{CREDIT_PAYMENTS_CSV_PATH.name}`")
+    with st.expander("Informations sur le stockage GitHub"):
+        st.write("Source permanente : dépôt GitHub privé `narvall018/station-pilot`.")
+        st.write("Branche de données : `data`.")
+        st.write("Fichiers : `station_data.csv`, `station_credits.csv` et "
+                 "`station_credit_payments.csv`.")
         st.write(
-            "SQLite reste la source principale. Le CSV est recréé automatiquement "
-            "après chaque ajout ou modification et peut restaurer une base vide."
+            "Chaque modification crée un commit atomique. SQLite est seulement un "
+            "cache temporaire de calcul et peut être supprimé sans perdre les données."
         )
 
 
@@ -4255,8 +4366,8 @@ def render_delete_section(history: pd.DataFrame) -> None:
 
     with st.expander("Supprimer des journées", expanded=False):
         st.caption(
-            "Action irréversible. Une sauvegarde complète de la base est créée "
-            "automatiquement avant chaque suppression, dans le dossier « backups »."
+            "La suppression crée un nouveau commit. La version précédente reste "
+            "récupérable dans l'historique de la branche GitHub « data »."
         )
         available = (
             history.dropna(subset=["record_date"])
@@ -4295,7 +4406,7 @@ def render_delete_section(history: pd.DataFrame) -> None:
         ):
             try:
                 deleted, backup_name = delete_records(selected)
-            except (OSError, sqlite3.Error) as exc:
+            except (OSError, sqlite3.Error, GitHubStorageError) as exc:
                 st.error(f"Suppression impossible : {exc}")
                 return
             if not deleted:
@@ -4304,7 +4415,7 @@ def render_delete_section(history: pd.DataFrame) -> None:
             dates = ", ".join(format_date_fr(value) for value in deleted)
             st.session_state["delete_feedback"] = (
                 f"{len(deleted)} journée(s) supprimée(s) : {dates}. "
-                f"Sauvegarde de sécurité : {backup_name}."
+                f"Point de restauration : {backup_name}."
             )
             st.session_state.pop("delete_selection", None)
             st.session_state.pop("delete_confirmation", None)
@@ -4354,14 +4465,14 @@ def render_sidebar_navigation(history: pd.DataFrame) -> str:
         st.markdown(
             f"""
             <div class="sidebar-status">
-                <strong>Données locales synchronisées</strong><br>
+                <strong>Données GitHub synchronisées</strong><br>
                 Dernière clôture : {latest_date}<br>
                 {record_count} journée(s) enregistrée(s)
             </div>
             """,
             unsafe_allow_html=True,
         )
-        st.caption("SQLite reste la source principale. Les sauvegardes CSV sont actualisées après chaque modification.")
+        st.caption("Les CSV permanents sont enregistrés sur la branche GitHub « data ».")
     return selected_page
 
 
@@ -4379,8 +4490,26 @@ def main() -> None:
     try:
         restored_rows = initialize_storage()
         history = load_data()
-    except (OSError, sqlite3.Error) as exc:
-        st.error(f"Impossible d'initialiser les fichiers de données : {exc}")
+    except StorageConfigurationError:
+        st.error("Le stockage GitHub n'est pas encore configuré.")
+        st.code(
+            '[github_storage]\n'
+            'token = "NOUVEAU_TOKEN_GITHUB"\n'
+            'owner = "narvall018"\n'
+            'repo = "station-pilot"\n'
+            'branch = "data"',
+            language="toml",
+        )
+        st.caption(
+            "Ajoutez ces valeurs dans les Secrets de Streamlit Cloud, avec un nouveau "
+            "token autorisé à lire et écrire le contenu du dépôt."
+        )
+        st.stop()
+    except GitHubStorageConflictError as exc:
+        st.warning(str(exc))
+        st.stop()
+    except (OSError, sqlite3.Error, GitHubStorageError) as exc:
+        st.error(f"Impossible de synchroniser les données GitHub : {exc}")
         st.stop()
 
     if restored_rows:
