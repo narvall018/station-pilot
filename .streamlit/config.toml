@@ -1,0 +1,32 @@
+# Valeurs de secours du thème clair, avec contraste renforcé. L’application
+# remplace dynamiquement les couleurs dépendantes du mode lors de chaque
+# exécution afin de conserver la bascule clair/sombre.
+[theme]
+font = "sans-serif"
+baseFontSize = 16
+baseFontWeight = 450
+headingFontWeights = [800, 750, 700, 700, 650, 650]
+primaryColor = "#0D684D"
+backgroundColor = "#F3F6F4"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#0B1712"
+linkColor = "#0D684D"
+borderColor = "#AFC2B9"
+greenColor = "#067238"
+redColor = "#B4232D"
+orangeColor = "#7A5310"
+blueColor = "#245A84"
+grayColor = "#42544B"
+baseRadius = "large"
+buttonRadius = "large"
+showWidgetBorder = true
+showSidebarBorder = false
+dataframeBorderColor = "#C9D6D0"
+dataframeHeaderBackgroundColor = "#E6EEE9"
+chartCategoricalColors = [
+  "#1E5FA8", "#C44A21", "#087A57", "#956600",
+  "#A23B6E", "#3F7D20", "#5847A6", "#B83238"
+]
+
+[client]
+toolbarMode = "minimal"

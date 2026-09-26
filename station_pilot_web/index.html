@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f5f7f6" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="Gestion locale de station-service USD / LL" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Station Pilot</title>
+    <script>
+      // Applique le thème avant le premier rendu pour éviter tout flash de couleur.
+      (function () {
+        try {
+          var stored = localStorage.getItem("station-pilot-theme");
+          var theme = stored === "light" || stored === "dark"
+            ? stored
+            : window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+          document.documentElement.dataset.theme = theme;
+          document.documentElement.style.colorScheme = theme;
+        } catch (error) {
+          document.documentElement.dataset.theme = "light";
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

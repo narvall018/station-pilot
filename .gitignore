@@ -1,0 +1,35 @@
+# Données métier locales
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.csv
+backups/
+
+# Secrets et configuration privée
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# JavaScript / builds
+node_modules/
+dist/
+*.log
+
+# Outils locaux
+.agents/
+.claude/
+.DS_Store
