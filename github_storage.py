@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -38,6 +39,9 @@ class GitHubStorage:
     api_root = "https://api.github.com"
     # Dépôts déjà vérifiés privés, partagés par toutes les sessions du processus.
     _verified_private_repos: set[str] = set()
+    # Dernier commit connu de chaque branche : (commit, arbre ou None, instant
+    # de la dernière confirmation), partagé par toutes les sessions du processus.
+    _known_heads: dict[str, tuple[str, str | None, float]] = {}
 
     def __init__(
         self,
@@ -162,8 +166,53 @@ class GitHubStorage:
                 raise
             return str(current["object"]["sha"])
 
+    @property
+    def _head_key(self) -> str:
+        return f"{self.repo_path}@{self.branch}"
+
+    def _remember_head(self, commit_sha: str, tree_sha: str | None = None) -> None:
+        known = self._known_heads.get(self._head_key)
+        if tree_sha is None and known is not None and known[0] == commit_sha:
+            tree_sha = known[1]
+        self._known_heads[self._head_key] = (commit_sha, tree_sha, time.monotonic())
+
+    def forget_head(self) -> None:
+        """Oublie le commit mémorisé : la prochaine lecture interrogera GitHub."""
+        self._known_heads.pop(self._head_key, None)
+
     def head_sha(self) -> str:
-        return self.ensure_branch()
+        head = self.ensure_branch()
+        self._remember_head(head)
+        return head
+
+    def cached_head_sha(self, max_age: float) -> str:
+        """Commit courant, relu sur GitHub au plus une fois toutes les ``max_age`` s.
+
+        Une valeur un peu ancienne reste sans danger : un commit construit sur
+        un parent périmé est refusé par GitHub (mise à jour non fast-forward).
+        """
+        known = self._known_heads.get(self._head_key)
+        if known is not None and time.monotonic() - known[2] < max_age:
+            return known[0]
+        return self.head_sha()
+
+    def _tree_entry(self, path: str, content: bytes) -> dict[str, str]:
+        entry = {"path": path.strip("/"), "mode": "100644", "type": "blob"}
+        try:
+            # Un texte UTF-8 est envoyé directement dans l'arbre : GitHub crée
+            # le blob lui-même, ce qui évite une requête par fichier.
+            entry["content"] = content.decode("utf-8")
+        except UnicodeDecodeError:
+            blob = self._request(
+                "POST",
+                f"{self.repo_path}/git/blobs",
+                {
+                    "content": base64.b64encode(content).decode("ascii"),
+                    "encoding": "base64",
+                },
+            )
+            entry["sha"] = str(blob["sha"])
+        return entry
 
     def download_files(
         self, paths: Sequence[str]
@@ -209,37 +258,24 @@ class GitHubStorage:
         if not files:
             return self.head_sha()
 
-        head = self.head_sha()
-        if expected_head is not None and head != expected_head:
-            raise GitHubStorageConflictError(
-                "Les données ont été modifiées dans une autre session. "
-                "Actualisez la page avant de recommencer."
-            )
-
-        commit = self._request("GET", f"{self.repo_path}/git/commits/{head}")
-        tree_entries: list[dict[str, str]] = []
-        for path, content in files.items():
-            blob = self._request(
-                "POST",
-                f"{self.repo_path}/git/blobs",
-                {
-                    "content": base64.b64encode(content).decode("ascii"),
-                    "encoding": "base64",
-                },
-            )
-            tree_entries.append(
-                {
-                    "path": path.strip("/"),
-                    "mode": "100644",
-                    "type": "blob",
-                    "sha": str(blob["sha"]),
-                }
-            )
+        self.ensure_private()
+        # Avec expected_head, inutile de relire la branche : si elle a bougé
+        # entre-temps, la mise à jour finale (non forcée) est refusée.
+        head = expected_head or self.head_sha()
+        known = self._known_heads.get(self._head_key)
+        if known is not None and known[0] == head and known[1] is not None:
+            base_tree = known[1]
+        else:
+            commit = self._request("GET", f"{self.repo_path}/git/commits/{head}")
+            base_tree = str(commit["tree"]["sha"])
 
         tree = self._request(
             "POST",
             f"{self.repo_path}/git/trees",
-            {"base_tree": commit["tree"]["sha"], "tree": tree_entries},
+            {
+                "base_tree": base_tree,
+                "tree": [self._tree_entry(path, content) for path, content in files.items()],
+            },
         )
         new_commit = self._request(
             "POST",
@@ -253,10 +289,12 @@ class GitHubStorage:
                 {"sha": new_commit["sha"], "force": False},
             )
         except GitHubStorageError as exc:
+            self.forget_head()
             if exc.status in {409, 422}:
                 raise GitHubStorageConflictError(
-                    "Une autre sauvegarde a été effectuée en même temps. "
+                    "Les données ont été modifiées dans une autre session. "
                     "Actualisez la page avant de recommencer."
                 ) from exc
             raise
+        self._remember_head(str(new_commit["sha"]), str(tree["sha"]))
         return str(new_commit["sha"])

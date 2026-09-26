@@ -7,6 +7,10 @@ Application de gestion quotidienne pour station-service, centrée sur une interf
 - clôture journalière avec continuité du stock et des caisses ;
 - suivi séparé des montants USD et LL ;
 - ventes, dépenses, crédits clients et remboursements ;
+- bénéfice réel : l’essence est déduite à son coût de revient, pas le jour où
+  la livraison est payée ;
+- contrôle des ventes d’essence : litres vendus × prix de vente comparé aux
+  ventes essence + crédits du jour ;
 - tableau de bord avec indicateurs et graphiques ;
 - historique, exports Excel et sauvegardes CSV sur GitHub ;
 - thèmes clair et sombre.
@@ -21,6 +25,16 @@ streamlit run app.py
 ```
 
 L’application est ensuite disponible sur `http://localhost:8501`.
+
+## Tests
+
+Les calculs (caisse, stock, crédits, bénéfice, contrôle des ventes) et le
+stockage GitHub sont couverts par des tests automatiques, sans accès réseau :
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
 
 ## Stockage permanent sur GitHub
 

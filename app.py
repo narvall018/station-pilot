@@ -46,6 +46,9 @@ REMOTE_DATA_FILES = {
     "data/station_credits.csv": CREDITS_CSV_PATH,
     "data/station_credit_payments.csv": CREDIT_PAYMENTS_CSV_PATH,
 }
+# Délai entre deux vérifications de la branche GitHub pendant la navigation.
+# Les enregistrements faits par l'app mettent ce suivi à jour immédiatement.
+REMOTE_CHECK_INTERVAL_S = 30
 
 
 class StorageConfigurationError(RuntimeError):
@@ -283,6 +286,7 @@ DB_COLUMNS: dict[str, str] = {
     "fuel_input_l": "REAL NOT NULL DEFAULT 0",
     "stock_available_l": "REAL NOT NULL DEFAULT 0",
     "fuel_cost_usd_per_l": "REAL NOT NULL DEFAULT 0",
+    "fuel_price_usd_per_l": "REAL NOT NULL DEFAULT 0",
     "stock_value_usd": "REAL NOT NULL DEFAULT 0",
     "fuel_volume_sold_l": "REAL NOT NULL DEFAULT 0",
     "fuel_sales_usd": "REAL NOT NULL DEFAULT 0",
@@ -736,6 +740,28 @@ def calculate_totals(record: Mapping[str, Any]) -> dict[str, float]:
     credit_sold_equiv = usd_equivalent(credit_sold)
     credit_collected_equiv = usd_equivalent(credit_collected)
 
+    # Bénéfice : l'essence compte à son coût de revient au moment où elle est
+    # vendue, pas le jour où la livraison est payée (« Achat d'essence »).
+    fuel_volume = _number(record, "fuel_volume_sold_l")
+    fuel_cost_of_sales = fuel_volume * _number(record, "fuel_cost_usd_per_l")
+    fuel_purchase_equiv = usd_equivalent(
+        {currency: _number(record, f"fuel_purchase_{currency}") for currency in currencies}
+    )
+    operating_expenses_equiv = expenses_equiv - fuel_purchase_equiv
+    profit_equiv = sales_equiv - fuel_cost_of_sales - operating_expenses_equiv
+
+    # Les ventes à crédit sont de l'essence : leurs litres sont inclus dans le
+    # volume vendu, leur montant doit donc compter dans les ventes d'essence.
+    fuel_revenue_equiv = (
+        usd_equivalent(
+            {currency: _number(record, f"fuel_sales_{currency}") for currency in currencies}
+        )
+        + credit_sold_equiv
+    )
+    fuel_price = _number(record, "fuel_price_usd_per_l")
+    expected_fuel_sales = fuel_volume * fuel_price
+    fuel_sales_gap = fuel_revenue_equiv - expected_fuel_sales if fuel_price > 0 else 0.0
+
     theoretical_stock = (
         _number(record, "opening_stock_l")
         + _number(record, "fuel_input_l")
@@ -749,6 +775,13 @@ def calculate_totals(record: Mapping[str, Any]) -> dict[str, float]:
         "net_usd_equiv": sales_equiv - expenses_equiv,
         "credit_sold_usd_equiv": credit_sold_equiv,
         "credit_collected_usd_equiv": credit_collected_equiv,
+        "fuel_cost_of_sales_usd": fuel_cost_of_sales,
+        "operating_expenses_usd_equiv": operating_expenses_equiv,
+        "profit_usd_equiv": profit_equiv,
+        "fuel_revenue_usd_equiv": fuel_revenue_equiv,
+        "fuel_margin_usd_equiv": fuel_revenue_equiv - fuel_cost_of_sales,
+        "expected_fuel_sales_usd": expected_fuel_sales,
+        "fuel_sales_gap_usd": fuel_sales_gap,
         "theoretical_stock_end_l": theoretical_stock,
         "stock_variance_l": actual_stock - theoretical_stock,
         "calculated_stock_value_usd": actual_stock
@@ -773,6 +806,11 @@ def calculate_totals(record: Mapping[str, Any]) -> dict[str, float]:
             }
         )
     return result
+
+
+def fuel_sales_gap_tolerance(expected_sales: float) -> float:
+    """Écart toléré (arrondis, rendu de monnaie) avant de signaler un problème."""
+    return max(5.0, expected_sales * 0.01)
 
 
 def enrich_data(frame: pd.DataFrame) -> pd.DataFrame:
@@ -993,7 +1031,7 @@ def restore_database_from_csv() -> int:
 def initialize_storage() -> int:
     """Synchronise le cache temporaire avec la branche GitHub de données."""
     storage = get_github_storage()
-    remote_head = storage.head_sha()
+    remote_head = storage.cached_head_sha(max_age=REMOTE_CHECK_INTERVAL_S)
     cache_ready = DB_PATH.exists() and all(
         path.exists() for path in REMOTE_DATA_FILES.values()
     )
@@ -1365,6 +1403,7 @@ def build_grouped_daily_export(history: pd.DataFrame) -> pd.DataFrame:
             "Stock réel fin L": _number(record, "stock_available_l"),
             "Écart stock L": _number(record, "stock_variance_l"),
             "Coût carburant USD/L": _number(record, "fuel_cost_usd_per_l"),
+            "Prix de vente USD/L": _number(record, "fuel_price_usd_per_l"),
             "Valeur stock USD": _number(record, "stock_value_usd"),
         }
         for label, prefix in (
@@ -1396,6 +1435,10 @@ def build_grouped_daily_export(history: pd.DataFrame) -> pd.DataFrame:
                 "Ventes USD équiv.": _number(record, "total_sales_usd_equiv"),
                 "Dépenses USD équiv.": _number(record, "total_expenses_usd_equiv"),
                 "Solde ventes-dépenses USD": _number(record, "net_usd_equiv"),
+                "Essence vendue au coût USD": _number(record, "fuel_cost_of_sales_usd"),
+                "Bénéfice USD équiv.": _number(record, "profit_usd_equiv"),
+                "Ventes essence attendues USD": _number(record, "expected_fuel_sales_usd"),
+                "Écart ventes essence USD": _number(record, "fuel_sales_gap_usd"),
                 "Crédit vendu USD équiv.": _number(record, "credit_sold_usd_equiv"),
                 "Crédit encaissé USD équiv.": _number(
                     record, "credit_collected_usd_equiv"
@@ -1442,6 +1485,8 @@ def build_excel_export(
         "net_usd",
         "net_lbp",
         "net_usd_equiv",
+        "profit_usd_equiv",
+        "fuel_sales_gap_usd",
         "credit_customer",
         "credit_sales_usd",
         "credit_sales_lbp",
@@ -1457,7 +1502,9 @@ def build_excel_export(
         "total_expenses_lbp": "Dépenses LL",
         "net_usd": "Solde USD",
         "net_lbp": "Solde LL",
-        "net_usd_equiv": "Résultat équiv. USD",
+        "net_usd_equiv": "Ventes − dépenses équiv. USD",
+        "profit_usd_equiv": "Bénéfice équiv. USD",
+        "fuel_sales_gap_usd": "Écart ventes essence USD",
         "credit_customer": "Client à crédit",
         "credit_sales_usd": "Crédits USD",
         "credit_sales_lbp": "Crédits LL",
@@ -2197,8 +2244,20 @@ def render_saved_summary(summary: Mapping[str, float], record_date: str, action:
         st.metric("Solde USD", format_usd(summary["net_usd"]))
         st.metric("Solde LL", format_lbp(summary["net_lbp"]))
 
+    profit_col, fuel_margin_col = st.columns(2)
+    profit_col.metric(
+        "Bénéfice du jour (équiv. USD)",
+        format_usd(summary["profit_usd_equiv"]),
+        help="Ventes − essence vendue au coût de revient − autres dépenses.",
+    )
+    fuel_margin_col.metric(
+        "Marge sur l'essence (équiv. USD)",
+        format_usd(summary["fuel_margin_usd_equiv"]),
+        help="Ventes essence + crédits − litres vendus × coût par litre.",
+    )
+
     st.markdown("##### Rapprochement automatique")
-    stock_col, cash_usd_col, cash_lbp_col = st.columns(3)
+    stock_col, cash_usd_col, cash_lbp_col, fuel_gap_col = st.columns(4)
     stock_col.metric(
         "Écart stock",
         f"{format_fr(summary['stock_variance_l'], 1)} L",
@@ -2206,6 +2265,22 @@ def render_saved_summary(summary: Mapping[str, float], record_date: str, action:
     )
     cash_usd_col.metric("Écart caisse USD", format_usd(summary["cash_variance_usd"]))
     cash_lbp_col.metric("Écart caisse LL", format_lbp(summary["cash_variance_lbp"]))
+    fuel_gap_col.metric(
+        "Écart ventes essence",
+        format_usd(summary["fuel_sales_gap_usd"])
+        if summary["expected_fuel_sales_usd"] > 0
+        else "Prix non saisi",
+        help="Ventes essence + crédits − litres vendus × prix de vente.",
+    )
+    gap = summary["fuel_sales_gap_usd"]
+    if abs(gap) > fuel_sales_gap_tolerance(summary["expected_fuel_sales_usd"]) and (
+        summary["expected_fuel_sales_usd"] > 0
+    ):
+        st.warning(
+            f"Les ventes d'essence diffèrent de {format_usd(gap)} de ce qu'elles devraient "
+            f"être ({format_usd(summary['expected_fuel_sales_usd'])} = litres × prix). "
+            "Vérifiez les litres, le prix, les ventes et les crédits."
+        )
 
 
 def navigate_to(page: str) -> None:
@@ -2302,7 +2377,7 @@ def render_home_page(history: pd.DataFrame) -> None:
     stock = _number(latest, "stock_available_l")
     stock_ratio = stock / capacity if capacity > 0 else 0
     stock_tone = "danger" if capacity > 0 and stock_ratio <= 0.2 else "warning" if stock_ratio <= 0.35 else "success"
-    net_value = _number(latest, "net_usd_equiv")
+    profit_value = _number(latest, "profit_usd_equiv")
 
     render_section_heading("Indicateurs de la dernière clôture", "Montants LL convertis au taux du jour")
     kpi_1, kpi_2, kpi_3, kpi_4 = st.columns(4)
@@ -2316,11 +2391,13 @@ def render_home_page(history: pd.DataFrame) -> None:
         )
     with kpi_2:
         render_stat_card(
-            "Résultat opérationnel",
-            format_usd(net_value),
-            comparison_detail("net_usd_equiv", "Ventes moins dépenses du jour"),
+            "Bénéfice du jour",
+            format_usd(profit_value),
+            comparison_detail(
+                "profit_usd_equiv", "Essence comptée à son coût de revient"
+            ),
             "◎",
-            "success" if net_value >= 0 else "danger",
+            "success" if profit_value >= 0 else "danger",
         )
     with kpi_3:
         render_stat_card(
@@ -2402,6 +2479,38 @@ def render_home_page(history: pd.DataFrame) -> None:
                 f"L'écart combiné représente {format_usd(cash_gap_equivalent)}. Vérifiez les encaissements et dépenses.",
                 "≋",
                 "danger",
+            )
+        )
+
+    latest_volume = _number(latest, "fuel_volume_sold_l")
+    expected_fuel_sales = _number(latest, "expected_fuel_sales_usd")
+    fuel_sales_gap = _number(latest, "fuel_sales_gap_usd")
+    if latest_volume > 0 and _number(latest, "fuel_price_usd_per_l") <= 0:
+        alerts.append(
+            (
+                "Prix de vente manquant",
+                "Renseignez le prix au litre dans la saisie pour contrôler les ventes d'essence.",
+                "$",
+                "info",
+            )
+        )
+    elif abs(fuel_sales_gap) > fuel_sales_gap_tolerance(expected_fuel_sales):
+        alerts.append(
+            (
+                "Écart sur les ventes d'essence",
+                f"Les ventes essence + crédits diffèrent de {format_usd(fuel_sales_gap)} "
+                f"de litres × prix ({format_usd(expected_fuel_sales)}).",
+                "Δ",
+                "danger",
+            )
+        )
+    if latest_volume > 0 and _number(latest, "fuel_cost_usd_per_l") <= 0:
+        alerts.append(
+            (
+                "Coût carburant manquant",
+                "Sans coût par litre, le bénéfice ne déduit pas l'essence vendue et paraît trop élevé.",
+                "!",
+                "warning",
             )
         )
     if outstanding_equivalent > 0:
@@ -2492,12 +2601,12 @@ def render_home_page(history: pd.DataFrame) -> None:
         )
         trend.add_scatter(
             x=recent["Libellé"],
-            y=recent["net_usd_equiv"],
-            name="Résultat",
+            y=recent["profit_usd_equiv"],
+            name="Bénéfice",
             mode="lines+markers",
             line={"color": palette["net"], "width": 2},
             marker={"size": 7},
-            hovertemplate="%{x}<br>Résultat : $%{y:,.2f}<extra></extra>",
+            hovertemplate="%{x}<br>Bénéfice : $%{y:,.2f}<extra></extra>",
         )
         apply_chart_style(trend, height=330)
         trend.update_layout(
@@ -2510,11 +2619,15 @@ def render_home_page(history: pd.DataFrame) -> None:
         st.plotly_chart(trend, width="stretch", config=PLOTLY_CONFIG)
 
     render_section_heading("Contrôle de clôture", "Valeurs réelles comparées aux calculs")
-    close_1, close_2, close_3, close_4 = st.columns(4)
+    close_1, close_2, close_3, close_4, close_5 = st.columns(5)
     close_1.metric("Écart stock", f"{format_fr(stock_variance, 1)} L")
     close_2.metric("Écart caisse USD", format_usd(_number(latest, "cash_variance_usd")))
     close_3.metric("Écart caisse LL", format_lbp(_number(latest, "cash_variance_lbp")))
-    close_4.metric("Taux LL / USD", format_fr(current_rate, 0))
+    close_4.metric(
+        "Écart ventes essence",
+        format_usd(fuel_sales_gap) if expected_fuel_sales > 0 else "Prix non saisi",
+    )
+    close_5.metric("Taux LL / USD", format_fr(current_rate, 0))
 
 
 def render_credits_page(history: pd.DataFrame) -> None:
@@ -2832,6 +2945,7 @@ def render_entry_tab(history: pd.DataFrame) -> bool:
             "tank_capacity_l": "tank_capacity_l",
             "opening_stock_l": "stock_available_l",
             "fuel_cost_usd_per_l": "fuel_cost_usd_per_l",
+            "fuel_price_usd_per_l": "fuel_price_usd_per_l",
             "cash_opening_usd": "cash_actual_end_usd",
             "cash_opening_lbp": "cash_actual_end_lbp",
         }
@@ -2943,13 +3057,26 @@ def render_entry_tab(history: pd.DataFrame) -> bool:
             )
 
         with entry_step_2:
-            fuel_1, fuel_2, fuel_3 = st.columns(3)
+            fuel_1, fuel_price_col, fuel_2, fuel_3 = st.columns(4)
             fuel_volume = fuel_1.number_input(
                 "Essence vendue (litres)",
                 min_value=0.0,
                 value=float(previous("fuel_volume_sold_l")),
                 step=0.01,
+                help="Tous les litres sortis de la cuve, y compris ceux pris à crédit.",
                 key=f"fuel_volume_{form_token}",
+            )
+            fuel_price = fuel_price_col.number_input(
+                "Prix de vente (USD/litre)",
+                min_value=0.0,
+                value=float(previous("fuel_price_usd_per_l")),
+                step=0.0001,
+                format="%.4f",
+                help=(
+                    "Sert à vérifier les ventes : litres × prix est comparé aux ventes "
+                    "essence + crédits du jour."
+                ),
+                key=f"fuel_price_{form_token}",
             )
             fuel_sales_usd = fuel_2.number_input(
                 "Ventes essence (USD)",
@@ -3219,6 +3346,7 @@ def render_entry_tab(history: pd.DataFrame) -> bool:
                 "fuel_input_l": fuel_input,
                 "stock_available_l": stock_available,
                 "fuel_cost_usd_per_l": fuel_cost,
+                "fuel_price_usd_per_l": fuel_price,
                 "stock_value_usd": stock_value
                 if stock_value > 0
                 else stock_available * fuel_cost,
@@ -3578,9 +3706,11 @@ def _render_dashboard_summary(
 ) -> None:
     equivalent_sales = period["total_sales_usd_equiv"].sum()
     equivalent_expenses = period["total_expenses_usd_equiv"].sum()
-    equivalent_net = period["net_usd_equiv"].sum()
+    fuel_cost_of_sales = period["fuel_cost_of_sales_usd"].sum()
+    operating_expenses = period["operating_expenses_usd_equiv"].sum()
+    equivalent_profit = period["profit_usd_equiv"].sum()
     volume = period["fuel_volume_sold_l"].sum()
-    margin = (equivalent_net / equivalent_sales * 100) if equivalent_sales else 0
+    margin = (equivalent_profit / equivalent_sales * 100) if equivalent_sales else 0
 
     delta_label = f"vs {previous_label}"
 
@@ -3616,12 +3746,12 @@ def _render_dashboard_summary(
         )
     with card_3:
         render_stat_card(
-            "Résultat net",
-            format_usd(equivalent_net),
-            f"{format_fr(margin, 1)} % de marge",
+            "Bénéfice",
+            format_usd(equivalent_profit),
+            f"{format_fr(margin, 1)} % de marge · essence au coût de revient",
             "◆",
-            "success" if equivalent_net >= 0 else "danger",
-            delta(equivalent_net, "net_usd_equiv"),
+            "success" if equivalent_profit >= 0 else "danger",
+            delta(equivalent_profit, "profit_usd_equiv"),
         )
     with card_4:
         render_stat_card(
@@ -3634,26 +3764,28 @@ def _render_dashboard_summary(
         )
 
     render_section_heading(
-        "Du chiffre d'affaires au résultat",
-        "Chaque étape montre ce qui construit puis entame le résultat.",
+        "Du chiffre d'affaires au bénéfice",
+        "L'essence est déduite à son coût de revient ; les achats de livraison "
+        "n'entrent pas dans le bénéfice.",
     )
     waterfall = go.Figure(
         go.Waterfall(
             orientation="v",
-            measure=["relative", "relative", "total"],
-            x=["Ventes", "Dépenses", "Résultat"],
-            y=[equivalent_sales, -equivalent_expenses, 0],
+            measure=["relative", "relative", "relative", "total"],
+            x=["Ventes", "Essence vendue (coût)", "Autres dépenses", "Bénéfice"],
+            y=[equivalent_sales, -fuel_cost_of_sales, -operating_expenses, 0],
             text=[
                 format_usd(equivalent_sales),
-                f"− {format_usd(equivalent_expenses)}",
-                format_usd(equivalent_net),
+                f"− {format_usd(fuel_cost_of_sales)}",
+                f"− {format_usd(operating_expenses)}",
+                format_usd(equivalent_profit),
             ],
             textposition="outside",
             textfont={"color": palette["muted"], "size": 12},
             connector={"line": {"color": palette["axis"], "width": 1}},
             increasing={"marker": {"color": palette["sales"]}},
             decreasing={"marker": {"color": palette["expenses"]}},
-            totals={"marker": {"color": palette["net"] if equivalent_net >= 0 else palette["expenses"]}},
+            totals={"marker": {"color": palette["net"] if equivalent_profit >= 0 else palette["expenses"]}},
             hovertemplate="%{x}<br>$%{y:,.2f}<extra></extra>",
         )
     )
@@ -3670,12 +3802,12 @@ def _render_dashboard_summary(
             f"{period_label} vs {previous_label}",
             f"{len(period)} journée(s) contre {len(previous_period)} de référence.",
         )
-        labels = ["Ventes", "Dépenses", "Résultat"]
-        current_values = [equivalent_sales, equivalent_expenses, equivalent_net]
+        labels = ["Ventes", "Dépenses", "Bénéfice"]
+        current_values = [equivalent_sales, equivalent_expenses, equivalent_profit]
         previous_values = [
             previous_period["total_sales_usd_equiv"].sum(),
             previous_period["total_expenses_usd_equiv"].sum(),
-            previous_period["net_usd_equiv"].sum(),
+            previous_period["profit_usd_equiv"].sum(),
         ]
         comparison = go.Figure()
         comparison.add_bar(
@@ -3712,7 +3844,7 @@ def _render_dashboard_summary(
 def _chart_frame(period: pd.DataFrame, period_mode: str) -> pd.DataFrame:
     """Série temporelle agrégée selon la granularité choisie."""
     source = period.sort_values("record_date").copy()
-    columns = ["total_sales_usd_equiv", "total_expenses_usd_equiv", "net_usd_equiv"]
+    columns = ["total_sales_usd_equiv", "total_expenses_usd_equiv", "profit_usd_equiv"]
     if period_mode == "Année":
         source["Période"] = source["record_date"].dt.month
         frame = source.groupby("Période", as_index=False)[columns].sum().sort_values("Période")
@@ -3766,7 +3898,7 @@ def _render_dashboard_evolution(
         hint = (
             f"En pointillés : {previous_label}, aligné rang par rang."
             if comparing
-            else "Vert : revenus · Orange : dépenses · Bleu : résultat net."
+            else "Vert : revenus · Orange : dépenses · Bleu : bénéfice."
         )
         render_section_heading("Évolution financière", hint)
         line = go.Figure()
@@ -3776,7 +3908,7 @@ def _render_dashboard_evolution(
             for column, color, name in (
                 ("total_sales_usd_equiv", palette["sales_prev"], "Revenus"),
                 ("total_expenses_usd_equiv", palette["expenses_prev"], "Dépenses"),
-                ("net_usd_equiv", palette["net_prev"], "Résultat"),
+                ("profit_usd_equiv", palette["net_prev"], "Bénéfice"),
             ):
                 line.add_scatter(
                     x=chart_data["Libellé"].head(len(aligned)),
@@ -3789,7 +3921,7 @@ def _render_dashboard_evolution(
         for column, color, name in (
             ("total_sales_usd_equiv", palette["sales"], "Revenus"),
             ("total_expenses_usd_equiv", palette["expenses"], "Dépenses"),
-            ("net_usd_equiv", palette["net"], "Résultat net"),
+            ("profit_usd_equiv", palette["net"], "Bénéfice"),
         ):
             line.add_scatter(
                 x=chart_data["Libellé"],
@@ -3986,18 +4118,18 @@ def _render_dashboard_breakdown(period: pd.DataFrame, palette: Mapping[str, Any]
         )
         group_figure.update_yaxes(title="Équivalent USD")
     elif analysis_group == "Totaux":
-        net = period["net_usd_equiv"].sum()
+        profit = period["profit_usd_equiv"].sum()
         group_figure.add_bar(
-            x=["Ventes", "Dépenses", "Résultat"],
+            x=["Ventes", "Dépenses", "Bénéfice"],
             y=[
                 period["total_sales_usd_equiv"].sum(),
                 period["total_expenses_usd_equiv"].sum(),
-                net,
+                profit,
             ],
             marker_color=[
                 palette["sales"],
                 palette["expenses"],
-                palette["sales"] if net >= 0 else palette["expenses"],
+                palette["sales"] if profit >= 0 else palette["expenses"],
             ],
             hovertemplate="%{x}<br>$%{y:,.2f}<extra></extra>",
         )
@@ -4044,7 +4176,8 @@ def _render_dashboard_journal(
                 "total_sales_lbp",
                 "total_expenses_usd",
                 "total_expenses_lbp",
-                "net_usd_equiv",
+                "profit_usd_equiv",
+                "fuel_sales_gap_usd",
             ]
         ]
         st.dataframe(
@@ -4060,7 +4193,10 @@ def _render_dashboard_journal(
                 "total_sales_lbp": st.column_config.NumberColumn("Ventes LL", format="%.0f"),
                 "total_expenses_usd": st.column_config.NumberColumn("Dépenses USD", format="$%.2f"),
                 "total_expenses_lbp": st.column_config.NumberColumn("Dépenses LL", format="%.0f"),
-                "net_usd_equiv": st.column_config.NumberColumn("Résultat équiv.", format="$%.2f"),
+                "profit_usd_equiv": st.column_config.NumberColumn("Bénéfice équiv.", format="$%.2f"),
+                "fuel_sales_gap_usd": st.column_config.NumberColumn(
+                    "Écart ventes essence", format="$%.2f"
+                ),
             },
         )
         st.download_button(
@@ -4197,6 +4333,8 @@ def render_history_tab(history: pd.DataFrame) -> None:
             "net_usd",
             "net_lbp",
             "net_usd_equiv",
+            "profit_usd_equiv",
+            "fuel_sales_gap_usd",
             "credit_customer",
         ]
         table = displayed[columns].copy()
@@ -4218,7 +4356,9 @@ def render_history_tab(history: pd.DataFrame) -> None:
         "total_expenses_lbp": st.column_config.NumberColumn("Dépenses LL", format="%.0f LL"),
         "net_usd": st.column_config.NumberColumn("Solde USD", format="$%.2f"),
         "net_lbp": st.column_config.NumberColumn("Solde LL", format="%.0f LL"),
-        "net_usd_equiv": st.column_config.NumberColumn("Résultat équiv. USD", format="$%.2f"),
+        "net_usd_equiv": st.column_config.NumberColumn("Ventes − dépenses équiv. USD", format="$%.2f"),
+        "profit_usd_equiv": st.column_config.NumberColumn("Bénéfice équiv. USD", format="$%.2f"),
+        "fuel_sales_gap_usd": st.column_config.NumberColumn("Écart ventes essence", format="$%.2f"),
         "credit_customer": st.column_config.TextColumn("Client à crédit"),
     }
     st.dataframe(
@@ -4291,7 +4431,7 @@ def render_history_tab(history: pd.DataFrame) -> None:
         journal_1.metric("Lignes d'opérations", f"{len(filtered_ledger):,}")
         journal_2.metric("Ventes (équiv. USD)", format_usd(journal_sales))
         journal_3.metric("Dépenses (équiv. USD)", format_usd(journal_expenses))
-        journal_4.metric("Résultat", format_usd(journal_sales - journal_expenses))
+        journal_4.metric("Ventes − dépenses", format_usd(journal_sales - journal_expenses))
         st.dataframe(
             filtered_ledger.sort_values(["Date", "Type"], ascending=[False, True]),
             hide_index=True,
